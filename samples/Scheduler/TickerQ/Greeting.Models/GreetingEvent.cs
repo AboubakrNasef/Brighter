@@ -4,8 +4,6 @@ namespace Greeting.Models
 {
     public class GreetingEvent : Event
     {
-        public GreetingEvent() : base(Id.Random()) { }
-
         public GreetingEvent(string name) : base(Id.Random())
         {
             Name = name;
