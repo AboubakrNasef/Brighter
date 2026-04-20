@@ -58,6 +58,8 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         private readonly TimeProvider _timeProvider;
         private readonly TimeSpan _sweepUncommittedInterval;
         private readonly SemaphoreSlim _flushToken = new(1, 1);
+        // The Kafka revoke window is ~10s; we use half to leave time for cleanup
+        private static readonly TimeSpan s_commitSyncTimeout = TimeSpan.FromSeconds(5);
         private readonly ITimer _sweeperTimer;
         private bool _hasFatalError;
         private bool _isClosed;
@@ -295,7 +297,10 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         public void Acknowledge(Message message)
         {
             if (!message.Header.Bag.TryGetValue(HeaderNames.PARTITION_OFFSET, out var bagData))
-                    return;
+            {
+                Log.CannotAcknowledgeMessage(s_logger, message.Id);
+                return;
+            }
             
             try
             {
@@ -345,23 +350,46 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         }
         
         /// <summary>
-        /// Nacks the specified message. For Kafka (stream-based), this is a no-op because not committing
-        /// the offset is sufficient to allow redelivery.
+        /// Nacks the specified message by seeking the consumer back to the message's offset,
+        /// so that the next <see cref="Receive"/> call will return the same message again.
         /// </summary>
         /// <param name="message">The message.</param>
         public void Nack(Message message)
         {
-            // No-op for Kafka: not committing the offset is sufficient for redelivery
+            if (!message.Header.Bag.TryGetValue(HeaderNames.PARTITION_OFFSET, out var bagData))
+            {
+                Log.CannotNackMessage(s_logger, message.Id);
+                return;
+            }
+
+            try
+            {
+                var topicPartitionOffset = bagData as TopicPartitionOffset;
+                if (topicPartitionOffset == null)
+                {
+                    Log.CannotNackMessageTypeMismatch(s_logger, message.Id, bagData?.GetType().FullName ?? "null");
+                    return;
+                }
+
+                Log.NackingMessage(s_logger, topicPartitionOffset.Offset.Value, topicPartitionOffset.Topic, topicPartitionOffset.Partition.Value);
+
+                _consumer.Seek(topicPartitionOffset);
+            }
+            catch (Exception ex) when (ex is KafkaException or InvalidOperationException)
+            {
+                Log.ErrorSeekingOffsetForNack(s_logger, ex.Message);
+            }
         }
 
         /// <summary>
-        /// Nacks the specified message. For Kafka (stream-based), this is a no-op because not committing
-        /// the offset is sufficient to allow redelivery.
+        /// Nacks the specified message by seeking the consumer back to the message's offset,
+        /// so that the next <see cref="ReceiveAsync"/> call will return the same message again.
         /// </summary>
         /// <param name="message">The message.</param>
         /// <param name="cancellationToken">Cancel the nack operation</param>
         public Task NackAsync(Message message, CancellationToken cancellationToken = default)
         {
+            Nack(message);
             return Task.CompletedTask;
         }
 
@@ -375,12 +403,19 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         {
             //we will be called twice if explicitly disposed as well as closed, so just skip in that case
             if (_isClosed) return;
-            
+
             try
             {
-                _flushToken.Wait(TimeSpan.Zero);
-                //this will release the semaphore
-               CommitAllOffsets(_timeProvider.GetUtcNow().UtcDateTime);
+                //wait for any in-flight background commit to finish before we commit remaining offsets
+                if (_flushToken.Wait(s_commitSyncTimeout))
+                {
+                    //this will release the semaphore
+                    CommitAllOffsets(_timeProvider.GetUtcNow().UtcDateTime);
+                }
+                else
+                {
+                    Log.SkippedCommittingOffsetsBeforeClose(s_logger);
+                }
             }
             catch (Exception ex)
             {
@@ -832,27 +867,43 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
 
         //Called during a revoke, we are passed the partitions that we are revoking and their last offset and we need to
         //commit anything we have not stored.
+        //We acquire the _flushToken to prevent concurrent commits with the background batch/sweep paths,
+        //as librdkafka is not thread-safe for concurrent commit operations.
         private void CommitOffsetsFor(List<TopicPartitionOffset> revokedPartitions)
         {
             try
             {
-                //find the provided set of partitions amongst our stored offsets 
-                var partitionOffsets = _offsetStorage.ToArray();
-                var revokedOffsetsToCommit =
-                    partitionOffsets.Where(tpo =>
-                            revokedPartitions.Any(ptc =>
-                                ptc.TopicPartition == tpo.TopicPartition 
-                                && ptc.Offset.Value != Offset.Unset.Value 
-                                && tpo.Offset.Value > ptc.Offset.Value 
-                            )
-                        )
-                        .ToList();
-                //determine if we have offsets still to commit
-                if (revokedOffsetsToCommit.Any())
+                //wait for any in-flight background commit to finish before we commit revoked offsets
+                if (!_flushToken.Wait(s_commitSyncTimeout))
                 {
-                    //commit them
-                    LogOffSetCommitRevokedPartitions(revokedOffsetsToCommit);
-                    _consumer.Commit(revokedOffsetsToCommit);
+                    Log.SkippedCommittingOffsetsForRevokedPartitions(s_logger);
+                    return;
+                }
+
+                try
+                {
+                    //find the provided set of partitions amongst our stored offsets
+                    var partitionOffsets = _offsetStorage.ToArray();
+                    var revokedOffsetsToCommit =
+                        partitionOffsets.Where(tpo =>
+                                revokedPartitions.Any(ptc =>
+                                    ptc.TopicPartition == tpo.TopicPartition
+                                    && ptc.Offset.Value != Offset.Unset.Value
+                                    && tpo.Offset.Value > ptc.Offset.Value
+                                )
+                            )
+                            .ToList();
+                    //determine if we have offsets still to commit
+                    if (revokedOffsetsToCommit.Any())
+                    {
+                        //commit them
+                        LogOffSetCommitRevokedPartitions(revokedOffsetsToCommit);
+                        _consumer.Commit(revokedOffsetsToCommit);
+                    }
+                }
+                finally
+                {
+                    _flushToken.Release(1);
                 }
             }
             catch (KafkaException error)
@@ -1175,9 +1226,21 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
             [LoggerMessage(LogLevel.Information, "Kafka consumer subscribing to {Topic}")]
             public static partial void SubscribingToTopic(ILogger logger, RoutingKey topic);
             
-            [LoggerMessage(LogLevel.Information, "Cannot acknowledge message {MessageId} as no offset data")]
+            [LoggerMessage(LogLevel.Warning, "Cannot acknowledge message {MessageId} as no offset data")]
             public static partial void CannotAcknowledgeMessage(ILogger logger, string messageId);
-            
+
+            [LoggerMessage(LogLevel.Warning, "Cannot nack message {MessageId} as no offset data")]
+            public static partial void CannotNackMessage(ILogger logger, string messageId);
+
+            [LoggerMessage(LogLevel.Warning, "Cannot nack message {MessageId} as offset data is unexpected type {ActualType}")]
+            public static partial void CannotNackMessageTypeMismatch(ILogger logger, string messageId, string actualType);
+
+            [LoggerMessage(LogLevel.Information, "Nacking message at offset {Offset} on topic {Topic} partition {Partition} - seeking back for redelivery")]
+            public static partial void NackingMessage(ILogger logger, long offset, string topic, int partition);
+
+            [LoggerMessage(LogLevel.Warning, "Error seeking offset for nack: {ErrorMessage}")]
+            public static partial void ErrorSeekingOffsetForNack(ILogger logger, string errorMessage);
+
             [LoggerMessage(LogLevel.Information, "Storing offset {Offset} to topic {Topic} for partition {ChannelName}")]
             public static partial void StoringOffset(ILogger logger, long offset, string topic, int channelName);
             
@@ -1243,6 +1306,12 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
             
             [LoggerMessage(LogLevel.Information, "Skipped sweeping offsets, as another commit or sweep was running")]
             public static partial void SkippedSweepingOffsets(ILogger logger);
+
+            [LoggerMessage(LogLevel.Warning, "Skipped committing offsets for revoked partitions, timed out waiting for in-flight commit to complete")]
+            public static partial void SkippedCommittingOffsetsForRevokedPartitions(ILogger logger);
+
+            [LoggerMessage(LogLevel.Warning, "Skipped committing offsets before close, timed out waiting for in-flight commit to complete")]
+            public static partial void SkippedCommittingOffsetsBeforeClose(ILogger logger);
             
             [LoggerMessage(LogLevel.Warning, "Message {MessageId} rejected with reason {RejectionReason} but no channels configured for rejection")]
             public static partial void NoChannelsConfiguredForRejection(ILogger logger, string messageId, string rejectionReason);
